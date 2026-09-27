@@ -33,6 +33,14 @@
 响应返回脱敏全文及源 / 结果 Unicode 码点半开区间映射（**未遮盖片段也可追溯**）。
 接口只读、**不写入任何数据**，相同快照与相同请求必然得到字节一致的结果。
 
+最后提供**文档增量事件流**（`GET /documents/{id}/events`）：版本、批注、迁移
+位置、人工确认、依赖与完成记录六类只追加记录按 `(created_at, type_rank, id)`
+**稳定合并**；首轮在**同一个 SQLite 读事务**中固定六张表最大行 ID 作为水位
+向量，续页游标封装文档 ID、起止水位与最后排序键，只读取 `(起点, 终点]` 且
+**始终沿用终点水位**（分页期间的并发新增留到下一轮，不漏、不重、不乱序）；
+末页返回 `resume_cursor` 用于续拉增量，**空轮也推进水位**；游标版本、结构、
+范围错误或跨文档使用一律 422，事件载荷只保留对应行落库时的稳定业务字段。
+
 ## 快速开始
 
 一条命令在 8000 端口启动（二选一）：
@@ -55,7 +63,7 @@ docker build -t annotation-api . && docker run -p 8000:8000 annotation-api
 ```bash
 pip install -r requirements-dev.txt
 uvicorn app.main:app --reload --port 8000   # 数据库默认写入 ./data/app.db
-pytest                                       # 运行测试（162 个用例）
+pytest                                       # 运行测试（183 个用例）
 ```
 
 可用环境变量 `DB_PATH` 指定 SQLite 文件路径。
@@ -334,6 +342,71 @@ ID 列表顺序必然相同。
 计算完全确定：相同快照（同一版本内容、同一批批注位置）与相同请求，
 响应序列化后**字节一致**（与请求中 ID 的排列顺序无关）。
 
+### 文档增量事件流
+
+`GET /documents/{id}/events?limit=&cursor=` 把文档的六类**只追加**记录合并为
+一条按时间稳定排序的事件流，适合做增量同步 / 审计订阅：
+
+| `type` | 来源表 | 归并序号 `type_rank` | `payload` 稳定业务字段 |
+|---|---|---|---|
+| `version` | 版本 | 1 | `version_id`、`version_number`、`content` |
+| `annotation` | 批注 | 2 | `annotation_id`、`body`、`selection`、`left_context`、`right_context`、`orig_start`、`orig_end`、`created_version_id` |
+| `location` | 迁移位置 | 3 | `location_id`、`annotation_id`、`version_id`、`status`、`start`、`end`、`left_match`、`right_match`、`score`、`candidates`、`carried_from` |
+| `confirmation` | 人工确认 | 4 | `confirmation_id`、`location_id`、`start`、`end`、`note` |
+| `dependency` | 依赖 | 5 | `dependency_id`、`prerequisite_id`、`dependent_id` |
+| `completion` | 完成记录 | 6 | `completion_id`、`annotation_id`、`note` |
+
+排序键是 **`(created_at, type_rank, id)` 全序**：`created_at` 相同（同一写
+事务内的行可能落在同一毫秒）时按类型序号定序，再按行 ID 定序，因此不重、
+不漏、不乱序。每个事件统一形如
+`{"type", "id", "created_at", "payload"}`。
+
+> **载荷只反映落库时的状态**：例如迁移位置事件保留库中的
+> `resolved` / `ambiguous` / `unresolved` 原始状态与顺延引用 `carried_from`，
+> 不会因为后来追加了人工确认而变成 `confirmed`（确认本身是一条独立的
+> `confirmation` 事件）；`carried_forward`、`version_number` 等查询时刻
+> 派生值也不出现在载荷中。
+
+**水位向量与读事务**：六张表各取一个最大行 ID，组成水位向量
+`{versions, annotations, locations, confirmations, dependencies, completions}`。
+首轮在**同一个 SQLite 读事务**（同一快照）中固定终点水位 `to`（起点 `from`
+为全零），随后该轮所有分页只读取窗口 **`(from, to]`**。只追加 + 自增 ID
+单调保证窗口内的行集此后永不变（旧窗口不丢行，新行 ID 必然更大）。
+
+**两种游标**（均为 Base64URL 紧凑 JSON，自带版本字段 `v`）：
+
+- `next_cursor`（`kind=page`，**续页**）：封装文档 ID、起止水位与**最后
+  排序键**；下一页返回窗口内排序键严格大于它的事件。窗口与终点水位
+  **始终沿用**首轮固定值——分页期间并发写入的行**留到下一轮**，绝不夹入
+  当前轮。窗口未读尽时每页返回 `next_cursor`；
+- `resume_cursor`（`kind=resume`，**续拉**）：**末页**（窗口读尽，包括空
+  窗口）返回，携带已消费水位；用它再调用时，服务在新的读事务中重新固定
+  终点水位，读取 `(from, 新 to]`。**没有新事件的空轮也会推进水位**
+  （末页仍返回新的 `resume_cursor`），因此客户端可以反复轮询而不会重放
+  旧事件，也不会漏掉其他文档写入推高全局行 ID 之后的新事件。
+
+响应字段：
+
+| 字段 | 含义 |
+|---|---|
+| `events` | 本页事件（至多 `limit` 条），按全序升序 |
+| `event_count` / `has_more` | 本页条数 / 窗口内是否还有后续页 |
+| `window.from` / `window.to` | 本轮窗口的起止水位向量（透明可审计） |
+| `next_cursor` | 续页游标；窗口读尽时为 `null` |
+| `resume_cursor` | 续拉游标；窗口未读尽时为 `null`（二者互斥） |
+
+`limit` 限 **1～200**（默认 50，越界由参数校验直接返回 422）。游标出现
+下列情况一律返回 **422**（`detail.error` 为机器码）：
+
+| 情况 | `error` |
+|---|---|
+| Base64 / JSON 无法解码、字段缺失或多余、水位键不全、类型不对 | `bad_cursor_structure` |
+| 游标版本号不支持 | `bad_cursor_version` |
+| 负水位、`from > to`、最后排序键不在窗口内、水位超过当前数据库 | `bad_cursor_range` |
+| 游标属于另一篇文档（不可跨文档使用） | `cross_document_cursor` |
+
+文档不存在返回 404。接口只读，不会创建或修改任何记录。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -363,6 +436,7 @@ ID 列表顺序必然相同。
 | GET | `/policies/{name}/revisions/{revision}` | 取某策略的指定修订 |
 | GET | `/documents/{id}/gate/evaluate?policy=&revision=&version=` | 同一读事务快照评估门禁，返回不短路的同形解释树 |
 | POST | `/documents/{id}/redact` | 批注驱动的脱敏副本：合并生效范围替换为占位，返回脱敏全文与源/结果码点区间映射（只读） |
+| GET | `/documents/{id}/events?limit=&cursor=` | 文档增量事件流：六类只追加记录按 (created_at, type_rank, id) 稳定合并，水位向量 + 续页/续拉游标分页（只读） |
 
 ## 完整示例
 
@@ -746,16 +820,102 @@ curl -X POST $B/documents/1/redact -H 'Content-Type: application/json' -d '{
 # 5. 只读：脱敏不改变任何数据；相同快照 + 相同请求多次调用结果字节一致。
 ```
 
+文档增量事件流示例（**首轮 → 分页 → 续拉**）：
+
+```bash
+B=http://localhost:8000
+
+# 1. 新建文档并创建两条批注：此时已有 1 个 version、2 个 annotation、
+#    2 个 location 事件，共 5 个
+curl -X POST $B/documents -H 'Content-Type: application/json' -d '{
+  "title": "事件流示例", "content": "甲。乙。"
+}'
+curl -X POST $B/documents/1/annotations -H 'Content-Type: application/json' -d \
+  '{"body":"批注甲","selection":"甲","start":0,"end":1}'
+curl -X POST $B/documents/1/annotations -H 'Content-Type: application/json' -d \
+  '{"body":"批注乙","selection":"乙","start":2,"end":3}'
+
+# 2. 【首轮】不带 cursor；limit=2 每页 2 条。
+#    同一读事务固定终点水位向量 window.to，事件按
+#    (created_at, type_rank, id) 全序返回；窗口未尽 → next_cursor
+curl "$B/documents/1/events?limit=2"
+# → {"document_id":1,"limit":2,"event_count":2,"has_more":true,
+#    "events":[
+#      {"type":"version","id":1,"created_at":"2026-09-27T07:40:40.542Z",
+#       "payload":{"version_id":1,"version_number":1,"content":"甲。乙。"}},
+#      {"type":"annotation","id":1,"created_at":"...",
+#       "payload":{"annotation_id":1,"body":"批注甲","selection":"甲",
+#                  "left_context":"","right_context":"",
+#                  "orig_start":0,"orig_end":1,"created_version_id":1}}],
+#    "window":{"from":{"versions":0,"annotations":0,...},
+#              "to":  {"versions":1,"annotations":2,"locations":2,
+#                      "confirmations":0,"dependencies":0,"completions":0}},
+#    "next_cursor":"eyJ2IjoxLCJraW5kIjoicGFnZSIs...（续页游标）",
+#    "resume_cursor":null}
+
+# 3. 【分页】带 next_cursor 继续翻页：窗口与终点水位完全沿用首轮，
+#    只按游标中的最后排序键向后取；即使此刻有并发写入也不会夹入本轮
+curl "$B/documents/1/events?limit=2&cursor=eyJ2IjoxLCJraW5kIjoicGFnZSIs..."
+# → events: [location#1, annotation#2]，仍返回 next_cursor（窗口还有 1 条）
+curl "$B/documents/1/events?limit=2&cursor=eyJ2IjoxLCJraW5kIjoicGFnZSIs..."
+# → events: [location#2]，has_more=false；末页不再给 next_cursor，
+#    改给 resume_cursor（其 from 即首轮终点水位）：
+# → {"event_count":1,"has_more":false,
+#    "next_cursor":null,
+#    "resume_cursor":"eyJ2IjoxLCJraW5kIjoicmVzdW1lIiwiZG9jIjox..."}
+
+# 4. 期间产生新写入：提交第 2 版（1 个 version + 2 个 location）、
+#    一条依赖、一条完成记录
+curl -X POST $B/documents/1/versions -H 'Content-Type: application/json' -d \
+  '{"content":"甲。乙。丙。"}'
+curl -X POST $B/documents/1/dependencies -H 'Content-Type: application/json' -d '{
+  "relations":[{"prerequisite_id":1,"dependent_id":2}]
+}'
+curl -X POST $B/documents/1/annotations/1/completions \
+  -H 'Content-Type: application/json' -d '{"note":"完成"}'
+
+# 5. 【续拉】用 resume_cursor 调用：在新的读事务固定新终点水位，
+#    只返回 (已消费水位, 新水位] 内的增量——旧事件一条都不重放
+curl "$B/documents/1/events?cursor=eyJ2IjoxLCJraW5kIjoicmVzdW1lIiwiZG9jIjox..."
+# → {"event_count":5,"has_more":false,
+#    "events":[
+#      {"type":"version","id":2,...,"payload":{"version_number":2,"content":"甲。乙。丙。"}},
+#      {"type":"location","id":3,...,"payload":{"status":"resolved",...,"carried_from":null}},
+#      {"type":"location","id":4,...},
+#      {"type":"dependency","id":1,...,"payload":{"prerequisite_id":1,"dependent_id":2}},
+#      {"type":"completion","id":1,...,"payload":{"annotation_id":1,"note":"完成"}}],
+#    "window":{"from":{"versions":1,"annotations":2,"locations":2,...},
+#              "to":  {"versions":2,"annotations":2,"locations":4,
+#                      "dependencies":1,"completions":1,...}},
+#    "next_cursor":null,"resume_cursor":"eyJ2IjoxLCJraW5kIjoicmVzdW1l..."}
+
+# 6. 【空轮】没有新事件时也可轮询：events 为空，但 resume_cursor 的水位
+#    会推进到当前最大行 ID（其他文档的写入也会推高全表水位）；无任何写入
+#    时新旧 resume_cursor 相同（幂等），可原样继续轮询
+curl "$B/documents/1/events?cursor=eyJ2IjoxLCJraW5kIjoicmVzdW1l..."
+# → {"event_count":0,"events":[],"next_cursor":null,
+#    "resume_cursor":"...（水位已推进或保持不变）"}
+
+# 7. 游标非法：无法解码 / 版本不支持 / 结构损坏 / 范围矛盾 / 跨文档 → 422
+curl "$B/documents/1/events?cursor=garbage%21%21%21"
+# → 422 {"detail":{"error":"bad_cursor_structure",
+#                  "message":"游标无法解码：应为 Base64URL 编码的紧凑 JSON"}}
+curl "$B/documents/2/events?cursor=eyJ2IjoxLCJraW5kIjoicmVzdW1l...文档1的游标"
+# → 422 {"detail":{"error":"cross_document_cursor",
+#                  "message":"游标属于文档 1，不能用于文档 2 的事件流（游标不可跨文档使用）"}}
+```
+
 ## 项目结构
 
 ```
 app/
-  main.py       # FastAPI 路由与迁移流程（含改动影响分析、审阅依赖编排、归档导出/核验、发布门禁、批注驱动脱敏接口）
+  main.py       # FastAPI 路由与迁移流程（含改动影响分析、审阅依赖编排、归档导出/核验、发布门禁、脱敏、增量事件接口）
   matching.py   # 锚点匹配核心（枚举落点、上下文打分、排序判定）
   diffing.py    # 两版全文的码点级编辑片段、范围投影与分类（纯函数）
   redacting.py  # 脱敏副本：生效范围合并为最大区间、按起点替换与源/结果码点区间映射（纯函数）
   review.py     # 审阅依赖图算法：环检测、传递前置、拓扑分层（纯函数）
   gate.py       # 发布门禁策略树：语法校验（深度/节点数/枚举域）与快照评估、同形解释树（纯函数）
+  events.py     # 文档增量事件流：六表水位向量、(created_at, type_rank, id) 稳定合并、续页/续拉游标编解码
   archive.py    # 迁移归档：同一读事务导出、规范化 JSON + SHA-256、离线一致性核验（不查库）
   db.py         # SQLite 连接、建表、读写事务
   schemas.py    # 请求体模型（含门禁策略、归档结构与核验请求模型）
@@ -767,6 +927,7 @@ tests/
   test_review.py    # 审阅依赖编排测试（依赖校验/环检测/审阅计划/完成记录）
   test_gate.py      # 发布门禁测试（策略语法拒绝/修订只追加/同事务快照评估/不短路解释树/稳定性）
   test_redacting.py # 批注驱动脱敏测试（范围合并/首尾相接/码点映射/整批可定位错误/字节稳定性/只读）
+  test_events.py    # 增量事件流测试（首轮六类合并/续页分页不漏不重/并发新增留到下一轮/续拉增量/空轮推进/游标422）
   test_archive.py   # 归档导出与离线核验测试（摘要篡改/缺行/串文档/顺延/确认非法）
 Dockerfile
 docker-compose.yml

@@ -31,6 +31,12 @@
   返回脱敏全文与源 / 结果码点半开区间映射（未遮盖片段同样可追溯）；
   跨文档、缺少位置、ambiguous / unresolved 等情况整批返回可定位错误，
   不猜测、不输出半成品，接口只读、不写入数据，相同快照与请求结果字节一致。
+- 文档增量事件流：版本、批注、迁移位置、人工确认、依赖与完成记录按
+  (created_at, type_rank, id) 稳定合并；首轮在同一个 SQLite 读事务中固定
+  六张表最大行 ID 作为水位向量，续页游标封装文档 ID、起止水位与最后排序
+  键，只读取 (起点, 终点] 且始终沿用终点水位（并发新增留到下一轮），
+  末页返回 resume_cursor 续拉增量，空轮也推进水位；游标版本、结构、范围
+  错误或跨文档使用返回 422；事件载荷只保留行落库时的稳定业务字段。
 """
 from __future__ import annotations
 
@@ -44,6 +50,7 @@ from fastapi.responses import JSONResponse
 
 from . import archive as archive_mod
 from . import db
+from . import events as events_mod
 from . import gate as gate_mod
 from .diffing import (
     classify_range,
@@ -80,7 +87,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="文档修订批注续接 API",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "基于选区 + 左右上下文锚点的批注跨版本续接，"
         "以及批注间的审阅依赖编排（依赖图校验、审阅计划、完成记录）。"
@@ -91,7 +98,9 @@ app = FastAPI(
         "以及文档发布门禁：策略修订按名称只追加，评估在同一读事务内锁定"
         "策略修订、目标版本与当前审阅状态，返回同形解释树；"
         "以及批注驱动的脱敏副本：同一读事务读取版本与生效位置，"
-        "重叠或首尾相接的范围合并替换，返回脱敏全文与码点区间映射。"
+        "重叠或首尾相接的范围合并替换，返回脱敏全文与码点区间映射；"
+        "以及文档增量事件流：六类只追加记录稳定合并，以水位向量 + "
+        "续页 / 续拉游标分页，窗口内不漏、不重、不乱序。"
     ),
     lifespan=lifespan,
 )
@@ -233,7 +242,7 @@ def _annotation_out(con: sqlite3.Connection, ann: sqlite3.Row) -> dict:
 def root():
     return {
         "service": "文档修订批注续接 API",
-        "version": "1.5.0",
+        "version": "1.6.0",
         "docs": "/docs",
         "offsets": "所有偏移均按 Unicode 码点计",
         "archive_format": archive_mod.ARCHIVE_FORMAT,
@@ -1598,4 +1607,95 @@ def evaluate_gate(
         "version_number": version_row["number"],
         "passed": tree["result"],
         "explanation": tree,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 文档增量事件流：六类只追加记录的稳定合并分页馈送
+# ---------------------------------------------------------------------------
+
+
+def _cursor_error(exc: events_mod.CursorError) -> HTTPException:
+    return HTTPException(
+        422, detail={"error": exc.error, "message": exc.message}
+    )
+
+
+@app.get("/documents/{document_id}/events")
+def document_events(
+    document_id: int,
+    limit: int = Query(50, ge=1, le=200, description="每页事件数（1～200）"),
+    cursor: Optional[str] = Query(
+        None, description="上一页返回的 next_cursor / resume_cursor"
+    ),
+    con=Depends(get_db),
+):
+    """文档增量事件流（只读）：版本、批注、迁移位置、人工确认、依赖、完成
+    记录按 ``(created_at, type_rank, id)`` **稳定合并**（全序，不漏 / 不重 /
+    不乱序）。
+
+    - **首轮**（不带 ``cursor``）：在**同一个 SQLite 读事务**（同一快照）中
+      固定六张表最大行 ID 作为终点水位向量 ``to``（起点 ``from`` 为全零），
+      读取窗口 ``(from, to]`` 内属于本文档的事件；
+    - **分页**（``next_cursor``，kind=page）：游标封装文档 ID、起止水位与
+      最后排序键，只返回窗口内排序键严格大于该键的事件；**始终沿用签发时的
+      终点水位**，分页期间并发新增的行（自增 ID 大于终点水位）留到下一轮；
+    - **续拉**（``resume_cursor``，kind=resume）：窗口读尽（末页）时返回；
+      携带已消费水位，本次调用重新固定终点水位，只读 ``(from, 新 to]``，
+      **空轮同样推进水位**（末页仍返回新的 resume_cursor）。
+
+    游标为 Base64URL 紧凑 JSON，自带版本号；游标版本不支持、结构损坏、
+    水位范围矛盾或**跨文档使用**一律 422。事件 ``payload`` 只保留对应行
+    落库时的稳定业务字段（例如迁移位置保留库中的 resolved / ambiguous /
+    unresolved 原始状态与顺延引用），**不计算查询时刻的派生状态**。
+    """
+    with db.read_transaction(con):
+        _get_document(con, document_id)
+        ceiling = events_mod.current_watermark(con)
+
+        if cursor is None:
+            window_from = events_mod.zero_watermark()
+            window_to = ceiling
+            last_key = None
+        else:
+            try:
+                parsed = events_mod.decode_cursor(cursor, document_id)
+                window_from = parsed["from"]
+                if parsed["kind"] == "resume":
+                    # 新一轮：沿用已消费水位为起点，在本快照固定新的终点水位
+                    events_mod.ensure_within(window_from, ceiling)
+                    window_to = ceiling
+                    last_key = None
+                else:
+                    # 续页：窗口与终点水位完全沿用游标，不受并发新增影响
+                    events_mod.ensure_within(parsed["to"], ceiling)
+                    window_to = parsed["to"]
+                    last_key = parsed["last"]
+            except events_mod.CursorError as exc:
+                raise _cursor_error(exc)
+
+        events, last_sort_key, has_more = events_mod.fetch_page(
+            con, document_id, window_from, window_to, last_key, limit
+        )
+
+    if has_more:
+        # 窗口未尽：签发续页游标（同一窗口推进最后排序键）
+        next_cursor = events_mod.make_page_cursor(
+            document_id, window_from, window_to, last_sort_key
+        )
+        resume_cursor = None
+    else:
+        # 末页（含事件为空的空轮）：签发续拉游标，已消费水位推进到窗口终点
+        next_cursor = None
+        resume_cursor = events_mod.make_resume_cursor(document_id, window_to)
+
+    return {
+        "document_id": document_id,
+        "limit": limit,
+        "event_count": len(events),
+        "has_more": has_more,
+        "events": events,
+        "window": {"from": window_from, "to": window_to},
+        "next_cursor": next_cursor,
+        "resume_cursor": resume_cursor,
     }
