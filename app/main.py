@@ -31,6 +31,13 @@
   返回脱敏全文与源 / 结果码点半开区间映射（未遮盖片段同样可追溯）；
   跨文档、缺少位置、ambiguous / unresolved 等情况整批返回可定位错误，
   不猜测、不输出半成品，接口只读、不写入数据，相同快照与请求结果字节一致。
+- 文档增量事件：GET /documents/{id}/events 把版本、批注、迁移位置、人工
+  确认、依赖与完成记录六类只追加行按 (created_at, type_rank, id) 稳定合并；
+  同一 SQLite 读事务快照内固定六表最大 ID 作为水位向量，游标封装文档 ID、
+  起止水位与最后排序键，只读取 (起点, 终点]：翻页始终沿用终点水位，
+  并发新增留到下一轮；末页给出 resume_cursor 续拉增量，空轮也推进水位；
+  游标版本 / 结构 / 范围错误或跨文档使用返回 422；事件载荷只保留记录的
+  稳定业务字段，不计算查询时刻的派生状态。
 """
 from __future__ import annotations
 
@@ -44,6 +51,7 @@ from fastapi.responses import JSONResponse
 
 from . import archive as archive_mod
 from . import db
+from . import events as events_mod
 from . import gate as gate_mod
 from .diffing import (
     classify_range,
@@ -80,7 +88,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="文档修订批注续接 API",
-    version="1.5.0",
+    version="1.6.0",
     description=(
         "基于选区 + 左右上下文锚点的批注跨版本续接，"
         "以及批注间的审阅依赖编排（依赖图校验、审阅计划、完成记录）。"
@@ -91,7 +99,10 @@ app = FastAPI(
         "以及文档发布门禁：策略修订按名称只追加，评估在同一读事务内锁定"
         "策略修订、目标版本与当前审阅状态，返回同形解释树；"
         "以及批注驱动的脱敏副本：同一读事务读取版本与生效位置，"
-        "重叠或首尾相接的范围合并替换，返回脱敏全文与码点区间映射。"
+        "重叠或首尾相接的范围合并替换，返回脱敏全文与码点区间映射；"
+        "以及文档增量事件：六类只追加记录在同一读事务快照内按"
+        "(created_at, type_rank, id) 稳定合并，水位向量 + 不透明游标"
+        "支持分页与 resume 续拉（空轮也推进水位）。"
     ),
     lifespan=lifespan,
 )
@@ -100,6 +111,14 @@ app = FastAPI(
 @app.exception_handler(sqlite3.IntegrityError)
 async def integrity_error_handler(request, exc):
     return JSONResponse(status_code=409, content={"detail": f"数据冲突：{exc}"})
+
+
+@app.exception_handler(events_mod.CursorError)
+async def cursor_error_handler(request, exc: events_mod.CursorError):
+    return JSONResponse(
+        status_code=422,
+        content={"detail": {"error": exc.code, "message": exc.message}},
+    )
 
 
 def get_db():
@@ -233,7 +252,7 @@ def _annotation_out(con: sqlite3.Connection, ann: sqlite3.Row) -> dict:
 def root():
     return {
         "service": "文档修订批注续接 API",
-        "version": "1.5.0",
+        "version": "1.6.0",
         "docs": "/docs",
         "offsets": "所有偏移均按 Unicode 码点计",
         "archive_format": archive_mod.ARCHIVE_FORMAT,
@@ -311,6 +330,117 @@ def list_versions(document_id: int, con=Depends(get_db)):
             }
             for r in rows
         ],
+    }
+
+
+# ---------------------------------------------------------------------------
+# 文档增量事件：六类只追加记录的稳定合并与游标续拉
+# ---------------------------------------------------------------------------
+
+
+@app.get("/documents/{document_id}/events")
+def list_document_events(
+    document_id: int,
+    limit: int = Query(
+        100, ge=1, le=200, description="单页事件条数，限 1～200（默认 100）"
+    ),
+    cursor: Optional[str] = Query(
+        None,
+        description=(
+            "不透明续页游标：首轮不传；翻页传上一页的 next_cursor；"
+            "续拉增量传上一轮末页的 resume_cursor"
+        ),
+    ),
+    con=Depends(get_db),
+):
+    """按 (created_at, type_rank, id) 稳定合并文档的六类只追加记录。
+
+    事件类型（type_rank 即并列 created_at 时的次序）：
+    version(1) / annotation(2) / location(3) / confirmation(4) /
+    dependency(5) / completion(6)。
+
+    - **首轮**（不带游标）：在同一个 SQLite 读事务快照内把六张表的该文档
+      最大行 ID 固定为终点水位向量（起点为全 0），只读取 (0, 终点]，
+      返回按合并序排列的事件；
+    - **翻页**（带 next_cursor）：始终沿用首轮固定的终点水位，即使读期间
+      有并发写入，超过终点水位的新行留到下一轮，不漏、不重、不乱序；
+    - **末页**：窗口内事件已读完，返回 resume_cursor（起、止水位都钉在
+      窗口终点）。用它**续拉增量**时在新快照里固定新终点，只读取
+      (旧终点, 新终点]；没有新增（空轮）也会返回推进后的新 resume_cursor；
+    - 游标版本不符、结构损坏、范围非法或跨文档使用一律 422；
+    - 事件载荷只保留对应记录落库时的稳定业务字段，不计算查询时刻的
+      派生状态（如 location 不叠加后续确认的生效值）。
+    """
+    with db.read_transaction(con):
+        _get_document(con, document_id)
+        if cursor is None:
+            parsed = events_mod.Cursor(
+                document_id=document_id,
+                start=(0,) * len(events_mod.TYPES),
+                end=events_mod.current_watermark(con, document_id),
+            )
+        else:
+            parsed = events_mod.decode_cursor(cursor, document_id)
+            if parsed.at_round_boundary:
+                # 末页 resume_cursor：开新一轮，起点钉在旧终点，
+                # 在当前快照固定新终点（空轮也随之推进水位）。
+                parsed = events_mod.Cursor(
+                    document_id=document_id,
+                    start=parsed.end,
+                    end=events_mod.current_watermark(con, document_id),
+                )
+            # 窗口中途的游标：start / end 原样沿用，终点水位不随并发写入移动。
+
+        events, has_more = events_mod.read_events(
+            con,
+            document_id,
+            parsed.start,
+            parsed.end,
+            limit,
+            after=parsed.last_key,
+        )
+        if events:
+            last = events[-1]
+            last_key: Optional[events_mod.SortKey] = (
+                last["created_at"],
+                events_mod.TYPE_RANK[last["type"]],
+                last["event_id"],
+            )
+        else:
+            last_key = parsed.last_key
+
+        window_watermark = events_mod.watermark_dict(parsed.end)
+        if has_more:
+            # 中途页：终点水位保持不变，携带最后排序键继续读同一窗口
+            next_cursor = events_mod.encode_cursor(
+                events_mod.Cursor(
+                    document_id=document_id,
+                    start=parsed.start,
+                    end=parsed.end,
+                    last_key=last_key,
+                )
+            )
+            resume_cursor = None
+        else:
+            # 末页：窗口读完，起 / 止水位都钉在窗口终点（无最后排序键）
+            next_cursor = None
+            resume_cursor = events_mod.encode_cursor(
+                events_mod.Cursor(
+                    document_id=document_id,
+                    start=parsed.end,
+                    end=parsed.end,
+                )
+            )
+
+    return {
+        "document_id": document_id,
+        "limit": limit,
+        "events": events,
+        "next_cursor": next_cursor,
+        "resume_cursor": resume_cursor,
+        "window_start_watermark": events_mod.watermark_dict(parsed.start),
+        "window_end_watermark": window_watermark,
+        "has_more": has_more,
     }
 
 
